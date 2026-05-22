@@ -362,16 +362,124 @@ function findRelated(q) {
   return results;
 }
 
-var SYS_PROMPT = 'You are an expert assistant for IBM Maximo Application Suite (MAS) 9.1, '
-  + 'embedded in the maxTeam documentation portal. '
-  + 'Give a COMPLETE and accurate answer. Use this structure:\n'
-  + '1. Direct answer (2-3 sentences)\n'
-  + '2. Key details as bullet points (- item)\n'
-  + '3. If steps are needed, use numbered list\n'
-  + 'Be technical and precise. Max 400 tokens. '
-  + 'Answer in the same language as the user (English or French).';
+var SYS_PROMPT = 'You are the maxTeam documentation portal assistant for IBM Maximo Application Suite (MAS) 9.1.\n\n'
+  + 'ABSOLUTE RULES — NO EXCEPTIONS:\n'
+  + '1. You answer ONLY from the DOCUMENTATION CONTEXT provided in the user message.\n'
+  + '2. You have NO other knowledge source. You know NOTHING about Maximo, IBM, OpenShift, watsonx, AWS, Kubernetes, or any other topic outside the provided context.\n'
+  + '3. If the answer is NOT explicitly in the provided context, reply EXACTLY:\n'
+  + '   - EN: "I could not find this information in the provided IBM MAS 9.1 documentation. Try rephrasing or browse the sections on the left."\n'
+  + '   - FR: "Je n\'ai pas trouvé cette information dans la documentation IBM MAS 9.1 fournie. Essayez de reformuler ou parcourez les sections à gauche."\n'
+  + '4. FORBIDDEN: invent, guess, extrapolate, complete with general knowledge, cite versions/numbers/commands not present in the context.\n'
+  + '5. FORBIDDEN: answer any off-topic question (weather, generic code, other products, etc.). State you are limited to the MAS 9.1 docs.\n'
+  + '6. You may ONLY paraphrase, structure, translate or summarise the context — never add information.\n\n'
+  + 'Response format:\n'
+  + '- Direct answer in 2-3 sentences\n'
+  + '- Bullet points (- item) for key details when relevant\n'
+  + '- Max 400 tokens\n'
+  + '- Reply in the same language as the question (FR or EN)';
+
+// Conversational prompt — used for greetings, thanks, small talk.
+// Knowledge questions outside MAS are politely declined and redirected.
+var SYS_PROMPT_CHAT = 'You are the maxTeam assistant for IBM MAS 9.1 documentation. Be warm and conversational.\n\n'
+  + 'RULES:\n'
+  + '- For greetings, thanks, small talk → respond warmly in 1-2 short sentences and invite the user to ask about MAS 9.1.\n'
+  + '- For self-questions (who are you, what can you do) → briefly say you are the maxTeam assistant for IBM MAS 9.1, and what topics you can help with (architecture, installation, licensing, watsonx, apps).\n'
+  + '- For ANY other knowledge question outside MAS (general facts, jokes, other products, math, weather, etc.) → politely decline and redirect: say you are specialised in IBM MAS 9.1 and offer to help with that.\n'
+  + '- NEVER answer technical MAS questions in this mode — if the user asks about Maximo, watsonx, installation, configuration, etc., ask them to rephrase so the documentation can be searched.\n'
+  + '- Max 2 sentences. Reply in the user language (FR or EN).';
+
+// Keywords that flag a question as technical (must go through doc RAG).
+// Lowercase only — matched against lowercased question via indexOf.
+var TECH_KEYWORDS = [
+  'maximo','mas ','mas9','mas8','watson','watsonx','ibm','openshift','ocp','kubernetes','k8s',
+  'kafka','mongodb','mongo','db2','couchdb','iceberg','presto','milvus',
+  'predict','monitor','manage','assist','collaborate','mvi','visual inspection','health',
+  'apppoint','app point','app-point','licens','entitlement','sls',
+  'install','installation','installer','deploy','déploiement','deploiement','configure','configuration',
+  'upgrade','migration','upgrad','mise à niveau','mise a niveau',
+  'cp4d','cloudpak','cloud pak','cloud-pak','workspace','tenant',
+  'ldap','saml','scim','sso','smtp','oauth','tls','ssl','cert-manager','cert manager','certificat',
+  'ansible','cloudformation','arm template','helm','terraform',
+  'tririga','scheduler','optimizer','mrf','mref','optim',
+  'prometheus','grafana','fusion','elasticsearch','loki','splunk','qradar',
+  'cluster','pod','namespace','operator','crd','custom resource','rbac',
+  'gpu','nvidia','a100','h100','h200','l40s','llm','foundation model','granite','llama','mistral','wml',
+  'backup','restore','sauvegarde','audit','siem',
+  'iot','mqtt','sensor','capteur',
+  'aws','azure','amazon','msk','documentdb','efs','ec2','rosa','aro','iaas',
+  'edge','sno','single node','single-node',
+  'jms','activemq','mq ','jvm','heap',
+  'mam','asset management','tririga',
+  'app connect','data reporter','dro',
+  'oracle','rwo','rwx','storage class',
+  'air-gap','air gap','airgap','disconnected','déconnecté','deconnecte',
+  'workload','sizing','dimensionnement','prerequis','prérequis','prerequisite',
+  'ports','firewall','pare-feu','dns','load balancer',
+  'rest api','rest','endpoint','bearer token','clé api','cle api','api key',
+  'audit log','journalisation','journal',
+  'role','rôle','user','utilisateur','group','groupe','registry','registre'
+];
+
+function isTechnical(q) {
+  var qL = ' ' + q.toLowerCase() + ' ';
+  for (var i = 0; i < TECH_KEYWORDS.length; i++) {
+    if (qL.indexOf(TECH_KEYWORDS[i]) !== -1) return true;
+  }
+  return false;
+}
 
 function ask(q) { document.getElementById('inp').value = q; send(); }
+
+// Build the documentation context: extracts the most relevant passages from SECTIONS
+// for the user's question. This is the ONLY source Groq is allowed to use.
+function buildContext(q) {
+  var qL = q.toLowerCase();
+  var words = qL.split(/\s+/).filter(function(w){ return w.length > 3; });
+  var scored = INDEX.map(function(e) {
+    var s = 0;
+    if (e.text.indexOf(qL) !== -1) s += 40;
+    words.forEach(function(w) {
+      if (e.heading.toLowerCase().indexOf(w) !== -1) s += 20;
+      if (e.text.indexOf(w) !== -1) s += 3;
+    });
+    return { e: e, s: s };
+  }).filter(function(x){ return x.s > 0; })
+    .sort(function(a,b){ return b.s - a.s; });
+
+  // Top 5 most relevant passages (across sections)
+  var top = scored.slice(0, 5);
+  if (top.length === 0) return null;
+
+  var ctx = '';
+  top.forEach(function(x) {
+    var sec = SECTIONS[x.e.si];
+    var useFr = currentLang === 'fr' && sec.fr;
+    var secTitle = useFr ? sec.fr.title : sec.title;
+    var subs = useFr ? (sec.fr.subsections || []) : (sec.subsections || []);
+    var match = null;
+    for (var i = 0; i < subs.length; i++) {
+      if (subs[i].heading === x.e.heading) { match = subs[i]; break; }
+    }
+    if (match) {
+      ctx += '### ' + secTitle + ' > ' + match.heading + '\n';
+      ctx += match.content + '\n';
+      if (match.bullets && match.bullets.length) {
+        ctx += match.bullets.map(function(b){ return '- ' + b; }).join('\n') + '\n';
+      }
+      ctx += '\n';
+    } else {
+      // Section-level match (summary + key facts)
+      ctx += '### ' + secTitle + '\n';
+      ctx += (useFr ? sec.fr.summary : sec.summary) + '\n';
+      var kf = useFr ? sec.fr.keyFacts : sec.keyFacts;
+      if (kf && kf.length) {
+        ctx += kf.map(function(b){ return '- ' + b; }).join('\n') + '\n';
+      }
+      ctx += '\n';
+    }
+  });
+  return ctx;
+}
 
 function send() {
   if (window.location.protocol === 'file:') {
@@ -390,11 +498,43 @@ function send() {
   addMsg('user', q);
   showThinking();
 
-  // Pre-compute related sections while waiting for Groq
   var related = findRelated(q);
+  var context = buildContext(q);
+  var technical = isTechnical(q) || (context !== null);
 
+  var systemPrompt, userMsgForGroq;
+
+  if (technical) {
+    // ── TECHNICAL MODE ── strict RAG, doc-only
+    if (!context) {
+      // Tech keyword detected but no matching doc → refuse cleanly, don't even call Groq
+      removeThinking();
+      var msgNoDoc = currentLang === 'fr'
+        ? 'Je n\'ai pas trouvé cette information dans la documentation IBM MAS 9.1 fournie. Essayez de reformuler ou parcourez les sections à gauche.'
+        : 'I could not find this information in the provided IBM MAS 9.1 documentation. Try rephrasing or browse the sections on the left.';
+      addRaw('bot', '<div class="no-result">' + msgNoDoc + '</div>');
+      return;
+    }
+    systemPrompt = SYS_PROMPT;
+    userMsgForGroq = '=== IBM MAS 9.1 DOCUMENTATION CONTEXT (ONLY ALLOWED SOURCE) ===\n\n'
+      + context
+      + '=== END OF CONTEXT ===\n\n'
+      + 'User question: ' + q + '\n\n'
+      + 'Answer ONLY from the context above. If the answer is not in it, say so using the exact fallback sentence from the rules.';
+  } else {
+    // ── CONVERSATIONAL MODE ── friendly small-talk, off-topic redirect
+    systemPrompt = SYS_PROMPT_CHAT;
+    userMsgForGroq = q;
+  }
+
+  // History keeps the raw question (not the augmented version)
   chatHistory.push({ role: 'user', content: q });
-  var messages = [{ role: 'system', content: SYS_PROMPT }].concat(chatHistory.slice(-6));
+
+  // Build messages: system + prior turns (clean) + current question (augmented if technical)
+  var prior = chatHistory.slice(-6, -1);
+  var messages = [{ role: 'system', content: systemPrompt }]
+    .concat(prior)
+    .concat([{ role: 'user', content: userMsgForGroq }]);
 
   fetch(GROQ_URL, {
     method: 'POST',
@@ -402,8 +542,8 @@ function send() {
     body: JSON.stringify({
       model: 'llama-3.3-70b-versatile',
       messages: messages,
-      temperature: 0.2,
-      max_tokens: 450,
+      temperature: technical ? 0.1 : 0.5,
+      max_tokens: technical ? 450 : 150,
       stream: false
     })
   })
@@ -423,9 +563,9 @@ function send() {
     }
     var reply = data.choices && data.choices[0] ? data.choices[0].message.content : 'No response.';
     chatHistory.push({ role: 'assistant', content: reply });
-    // Append "read more" section tags
     var html = formatReply(reply);
-    if (related.length) {
+    // Only show "read more" doc-link tags in technical mode
+    if (technical && related.length) {
       html += buildReadMore(related);
     }
     addRaw('bot', html);
